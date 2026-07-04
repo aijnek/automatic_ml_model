@@ -30,6 +30,14 @@
 ## 使い方
 
 ```bash
+# 0. （任意）学習用画像の収集。Openverse API から8カテゴリ×50枚を data/images/ に収集し、
+#    出典・ライセンスを data/collection_metadata.csv に記録する。不足カテゴリは画像加工で補完
+uv run python scripts/collect_images.py
+
+# 0'. （任意）目視で選別しながら収集するUI。クエリ検索 → サムネイル一覧から
+#     適した画像だけチェックして保存（保存済み・除外済みはグレーアウト/非表示）
+uv run streamlit run app/collect.py
+
 # 1. 問題設定 + 画像アップロード + アノテーション（ブラウザが開く）
 uv run streamlit run app/annotate.py
 
