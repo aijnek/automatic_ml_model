@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# パイプライン生成物
+data/
+schemas/
+features/
+models/
+results/
+state.json
+config.yaml
