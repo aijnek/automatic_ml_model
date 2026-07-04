@@ -1,8 +1,9 @@
 # macOS
 .DS_Store
 
-# Claude Code ローカル設定
-.claude/
+# Claude Code ローカル設定（プロジェクトスキルは追跡する）
+.claude/*
+!.claude/skills/
 
 # Python-generated files
 __pycache__/
@@ -20,6 +21,7 @@ wheels/
 
 # パイプライン生成物
 data/
+archive/
 schemas/
 features/
 models/
