@@ -205,3 +205,14 @@ def test_design_schema_revision_includes_report(clf_config, sample_schema):
     names = {f["name"] for f in designer.active_features(schema)}
     assert "brightness" not in names
     assert {"extra_a", "extra_b"} <= names
+
+
+def test_revision_prompt_includes_reliability_policy(clf_config, sample_schema):
+    prompt = designer.build_revision_prompt(clf_config, sample_schema, "# レポート")
+    assert "抽出信頼性" in prompt
+    assert "不安定" in prompt and "縮退" in prompt and "抽出失敗" in prompt
+
+
+def test_format_spec_requires_objective_prompts(clf_config):
+    prompt = designer.build_initial_prompt(clf_config)
+    assert "客観的な質問" in prompt

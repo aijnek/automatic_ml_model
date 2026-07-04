@@ -41,6 +41,7 @@ def vlm_chat(
     image_path: Path,
     format_schema: dict,
     timeout: float = 120.0,
+    temperature: float = 0.0,
 ) -> str:
     """画像1枚 + プロンプトを VLM に投げ、structured output（JSON文字列）を返す。
 
@@ -59,7 +60,7 @@ def vlm_chat(
             }
         ],
         format=format_schema,
-        options={"temperature": 0, "num_predict": 1024},
+        options={"temperature": temperature, "num_predict": 1024},
     )
     try:
         response = client.chat(think=False, **kwargs)

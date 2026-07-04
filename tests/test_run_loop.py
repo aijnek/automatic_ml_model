@@ -50,7 +50,7 @@ class FakeDesigner:
 def make_fake_vlm(label_map: dict[str, str]):
     """dominant_color だけ正解ラベルを返し、他はファイル名ハッシュで決まるノイズ。"""
 
-    def vlm(model, prompt, image_path, format_schema):
+    def vlm(model, prompt, image_path, format_schema, **_):
         name = image_path.name
         out = {}
         for key in format_schema["properties"]:
@@ -68,6 +68,8 @@ def make_fake_vlm(label_map: dict[str, str]):
 @pytest.fixture
 def env(tmp_path, clf_config, clf_annotations):
     """splits・画像・パス一式を tmp_path に用意する。"""
+    clf_config.verify_sample_size = 5  # 検証を軽くしてテストを高速化
+    clf_config.verify_n_repeats = 2
     dirs = {
         "splits_dir": tmp_path / "splits",
         "images_dir": tmp_path / "images",
@@ -121,9 +123,25 @@ def test_improves_over_iterations(env):
     # 2回目の designer プロンプトには前回の診断レポートが含まれる
     assert "診断レポート" in designer.calls[1]
     assert "brightness" in designer.calls[1]
+    # 抽出品質検証の結果が保存され、レポート経由で designer に届く
+    assert (dirs["results_dir"] / "iter1" / "extraction_quality.json").exists()
+    assert "抽出信頼性" in designer.calls[1]
     # スキーマが2バージョン保存されている
     assert (dirs["schemas_dir"] / "metadata_v1.json").exists()
     assert (dirs["schemas_dir"] / "metadata_v2.json").exists()
+
+
+def test_verification_disabled(env):
+    cfg, dirs, label_map = env
+    cfg.verification_enabled = False
+    designer = FakeDesigner(informative_from_call=1)
+    state = run_loop.run(
+        cfg, designer_llm_fn=designer, vlm_fn=make_fake_vlm(label_map), **dirs
+    )
+    assert state["finished"] is True
+    assert not (dirs["results_dir"] / "iter1" / "extraction_quality.json").exists()
+    report_md = (dirs["results_dir"] / "iter1" / "report.md").read_text()
+    assert "抽出信頼性" not in report_md
 
 
 def test_resume_after_interruption(env):

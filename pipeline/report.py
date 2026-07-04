@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pandas as pd
+
 from pipeline.config import Config
+from pipeline.verify import classify_status
 
 
 def _fmt_value(v) -> str:
@@ -16,7 +19,98 @@ def _fmt_value(v) -> str:
     return str(v)
 
 
-def build_report_md(cfg: Config, iteration: int, result: dict) -> str:
+def _fmt_rate(v) -> str:
+    return "-" if v is None else f"{v:.2f}"
+
+
+def compute_distribution_stats(
+    features_df: pd.DataFrame, features: list[dict]
+) -> dict[str, dict]:
+    """全データの特徴量CSVから NaN率・最頻値割合・ユニーク数を計算する。"""
+    stats: dict[str, dict] = {}
+    for f in features:
+        name = f["name"]
+        if name not in features_df.columns:
+            continue
+        col = features_df[name]
+        valid = col.dropna()
+        if f["type"] == "float":
+            valid = valid.round(3)  # 微小差を同一視して縮退を検出
+        stats[name] = {
+            "nan_rate": float(col.isna().mean()) if len(col) else None,
+            "mode_fraction": (
+                float(valid.value_counts(normalize=True).iloc[0]) if len(valid) else None
+            ),
+            "n_unique": int(valid.nunique()),
+        }
+    return stats
+
+
+def build_quality_records(
+    cfg: Config,
+    extraction_quality: dict,
+    dist_stats: dict[str, dict],
+    features: list[dict],
+) -> dict[str, dict]:
+    """検証シグナル＋全データ分布を特徴量ごとにマージし、status を判定する。"""
+    records: dict[str, dict] = {}
+    signals_by_name = extraction_quality.get("features", {})
+    for f in features:
+        name = f["name"]
+        signals = signals_by_name.get(name)
+        dist = dist_stats.get(name)
+        status, reasons = classify_status(signals, dist, cfg)
+        records[name] = {
+            "status": status,
+            "reasons": reasons,
+            "consistency": (signals or {}).get("consistency"),
+            "cross_agreement": (signals or {}).get("cross_agreement"),
+            "carried_forward": (signals or {}).get("carried_forward", False),
+            "nan_rate": (dist or {}).get("nan_rate"),
+            "mode_fraction": (dist or {}).get("mode_fraction"),
+            "n_unique": (dist or {}).get("n_unique"),
+        }
+    return records
+
+
+def _quality_section(quality_records: dict[str, dict], reference_model: str) -> list[str]:
+    lines = [
+        "",
+        "## 抽出信頼性（VLMメタデータ抽出の品質検証）",
+        "",
+        f"trainサンプル画像の複数回再抽出による自己一致率と、参照VLM（{reference_model}）"
+        "との一致率:",
+        "",
+        "| 特徴量 | 判定 | 自己一致率 | 参照VLM一致率 | NaN率(全データ) | 最頻値割合 |",
+        "|---|---|---|---|---|---|",
+    ]
+    for name, rec in quality_records.items():
+        status = rec["status"]
+        if rec["reasons"]:
+            status += " ← " + "、".join(rec["reasons"])
+        lines.append(
+            f"| {name} | {status} | {_fmt_rate(rec['consistency'])} "
+            f"| {_fmt_rate(rec['cross_agreement'])} | {_fmt_rate(rec['nan_rate'])} "
+            f"| {_fmt_rate(rec['mode_fraction'])} |"
+        )
+    lines += [
+        "",
+        "- 判定の意味: 安定=抽出は信頼できる / 不安定=同じ画像でも値が揺れる"
+        "（プロンプトが曖昧） / 縮退=ほぼ全画像で同じ値（情報量なし） / "
+        "抽出失敗=VLMが答えられずNaNになる",
+        "- 「重要度が低い」は必ずしも観点が悪いとは限らない。不安定な特徴量は"
+        "抽出ノイズで重要度が過小評価されている可能性がある。",
+    ]
+    return lines
+
+
+def build_report_md(
+    cfg: Config,
+    iteration: int,
+    result: dict,
+    quality_records: dict[str, dict] | None = None,
+    reference_model: str = "",
+) -> str:
     """人間可読 & designer 入力用のマークダウンレポート。"""
     lines = [
         f"# イテレーション {iteration} 診断レポート",
@@ -54,6 +148,9 @@ def build_report_md(cfg: Config, iteration: int, result: dict) -> str:
         flag = " ← 寄与ほぼゼロ" if imp < 0.02 else ""
         lines.append(f"- {name}: {imp:.3f}{flag}")
 
+    if quality_records:
+        lines += _quality_section(quality_records, reference_model)
+
     worst = result["worst_val_samples"]
     if worst:
         title = "誤分類サンプル" if cfg.is_classification else "高誤差サンプル"
@@ -71,15 +168,39 @@ def build_report_md(cfg: Config, iteration: int, result: dict) -> str:
 
 
 def save_iteration_report(
-    cfg: Config, iteration: int, result: dict, out_dir: Path
+    cfg: Config,
+    iteration: int,
+    result: dict,
+    out_dir: Path,
+    extraction_quality: dict | None = None,
+    features_df: pd.DataFrame | None = None,
+    schema: dict | None = None,
 ) -> str:
-    """report.json / report.md を保存し、markdown を返す。"""
+    """report.json / report.md を保存し、markdown を返す。
+
+    extraction_quality（verify.run_verification の結果）と features_df / schema が
+    揃っていれば、抽出信頼性セクションをレポートに含める。
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     serializable = {k: v for k, v in result.items() if not k.startswith("_")}
+
+    quality_records = None
+    reference_model = ""
+    if extraction_quality is not None and features_df is not None and schema is not None:
+        from pipeline.designer import active_features  # 循環import回避
+
+        features = active_features(schema)
+        dist_stats = compute_distribution_stats(features_df, features)
+        quality_records = build_quality_records(
+            cfg, extraction_quality, dist_stats, features
+        )
+        reference_model = extraction_quality.get("reference_model", "")
+        serializable["extraction_quality"] = quality_records
+
     (out_dir / "report.json").write_text(
         json.dumps(serializable, ensure_ascii=False, indent=2)
     )
-    md = build_report_md(cfg, iteration, result)
+    md = build_report_md(cfg, iteration, result, quality_records, reference_model)
     (out_dir / "report.md").write_text(md)
     return md
 
