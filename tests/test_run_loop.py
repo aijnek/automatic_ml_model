@@ -144,6 +144,46 @@ def test_verification_disabled(env):
     assert "抽出信頼性" not in report_md
 
 
+def test_feature_selection_runs_on_pass(env):
+    cfg, dirs, label_map = env
+    designer = FakeDesigner(informative_from_call=1)
+    state = run_loop.run(
+        cfg, designer_llm_fn=designer, vlm_fn=make_fake_vlm(label_map), **dirs
+    )
+    assert state["finished"] is True
+    assert state["test_score"] > 0.9
+    assert (dirs["results_dir"] / "feature_selection.json").exists()
+    assert (dirs["schemas_dir"] / "metadata_v1_selected.json").exists()
+    fs = state["feature_selection"]
+    assert {"n_features_before", "n_features_after", "removed",
+            "val_score_before", "val_score_after"} <= set(fs)
+    final_md = (dirs["results_dir"] / "final_report.md").read_text()
+    assert "特徴量選択" in final_md
+    # ノイズ3特徴量 + dominant_color なので少なくとも1つは除去されるはず
+    assert fs["removed"]
+    assert (dirs["models_dir"] / "model_v1_selected.txt").exists()
+    selected = json.loads(
+        (dirs["schemas_dir"] / "metadata_v1_selected.json").read_text()
+    )
+    n_active = sum(1 for f in selected["features"] if f["action"] != "removed")
+    assert n_active == fs["n_features_after"] < 4
+
+
+def test_feature_selection_disabled(env):
+    cfg, dirs, label_map = env
+    cfg.feature_selection_enabled = False
+    designer = FakeDesigner(informative_from_call=1)
+    state = run_loop.run(
+        cfg, designer_llm_fn=designer, vlm_fn=make_fake_vlm(label_map), **dirs
+    )
+    assert state["finished"] is True
+    assert not (dirs["results_dir"] / "feature_selection.json").exists()
+    assert not (dirs["schemas_dir"] / "metadata_v1_selected.json").exists()
+    assert "feature_selection" not in state
+    final_md = (dirs["results_dir"] / "final_report.md").read_text()
+    assert "特徴量選択" not in final_md
+
+
 def test_resume_after_interruption(env):
     cfg, dirs, label_map = env
     vlm = make_fake_vlm(label_map)

@@ -64,6 +64,10 @@ class Config:
     verify_agreement_threshold: float = 0.6  # 参照VLM一致率がこれ未満 → 不安定
     verify_nan_rate_threshold: float = 0.2  # NaN率がこれ超 → 抽出失敗
     verify_mode_fraction_threshold: float = 0.95  # 最頻値割合がこれ超 → 縮退
+    # 特徴量選択（step 7.5）。合格モデルに対して重要度ベースの後方消去を行う
+    feature_selection_enabled: bool = True
+    select_max_score_drop: float = 0.01  # baseline からの許容 val スコア低下
+    select_min_features: int = 1  # これ未満には削減しない
 
     @property
     def is_classification(self) -> bool:
@@ -120,6 +124,11 @@ def save_config(cfg: Config, path: Path = CONFIG_PATH) -> None:
                 "mode_fraction": cfg.verify_mode_fraction_threshold,
             },
         },
+        "feature_selection": {
+            "enabled": cfg.feature_selection_enabled,
+            "max_score_drop": cfg.select_max_score_drop,
+            "min_features": cfg.select_min_features,
+        },
     }
     path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False))
 
@@ -133,6 +142,7 @@ def load_config(path: Path = CONFIG_PATH) -> Config:
     target = task.get("target_range") or {}
     verification = data.get("verification", {})
     v_thresholds = verification.get("thresholds", {})
+    selection = data.get("feature_selection", {})
     cfg = Config(
         task_type=task["type"],
         description=task.get("description", ""),
@@ -161,6 +171,9 @@ def load_config(path: Path = CONFIG_PATH) -> Config:
         verify_agreement_threshold=float(v_thresholds.get("cross_agreement", 0.6)),
         verify_nan_rate_threshold=float(v_thresholds.get("nan_rate", 0.2)),
         verify_mode_fraction_threshold=float(v_thresholds.get("mode_fraction", 0.95)),
+        feature_selection_enabled=bool(selection.get("enabled", True)),
+        select_max_score_drop=float(selection.get("max_score_drop", 0.01)),
+        select_min_features=int(selection.get("min_features", 1)),
     )
     cfg.validate()
     return cfg

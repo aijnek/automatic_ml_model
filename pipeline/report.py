@@ -211,6 +211,7 @@ def build_final_report_md(
     history: list[dict],
     test_result: dict,
     schema: dict,
+    selection: dict | None = None,
 ) -> str:
     lines = [
         "# 最終レポート",
@@ -247,6 +248,32 @@ def build_final_report_md(
             f"- iter {h['iteration']}: val {cfg.metric_name} = {h['val_score']:.4f}"
             f"（特徴量 {h['n_features']}個）{marker}"
         )
+
+    if selection is not None:
+        lines += [
+            "",
+            "## 特徴量選択（後方消去）",
+            "",
+            f"- val {cfg.metric_name}: {selection['baseline_val_score']:.4f} → "
+            f"{selection['final_val_score']:.4f}"
+            f"（許容低下 {selection['max_score_drop']}）",
+            f"- 特徴量数: {selection['n_features_before']} → "
+            f"{selection['n_features_after']}",
+            "- 除去: "
+            + (", ".join(selection["removed"]) if selection["removed"] else "なし"),
+        ]
+        if selection["rounds"]:
+            lines += [
+                "",
+                f"| ラウンド | 除去候補 | 重要度 | val {cfg.metric_name} | 低下 | 判定 |",
+                "|---|---|---|---|---|---|",
+            ]
+            for i, r in enumerate(selection["rounds"], start=1):
+                lines.append(
+                    f"| {i} | {r['feature']} | {r['importance']:.4f} "
+                    f"| {r['val_score']:.4f} | {r['score_drop']:+.4f} "
+                    f"| {'採用' if r['accepted'] else '棄却'} |"
+                )
 
     lines += ["", "## 最終特徴量スキーマ"]
     from pipeline.designer import active_features  # 循環import回避
