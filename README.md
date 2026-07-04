@@ -30,12 +30,13 @@
 ## 使い方
 
 ```bash
-# 0. （任意）学習用画像の収集。Openverse API から8カテゴリ×50枚を data/images/ に収集し、
+# 0. （任意）学習用画像の収集。複数の画像APIから8カテゴリ×50枚を data/images/ に収集し、
 #    出典・ライセンスを data/collection_metadata.csv に記録する。不足カテゴリは画像加工で補完
-uv run python scripts/collect_images.py
+uv run python scripts/collect_images.py                      # キー設定済みの全ソース
+uv run python scripts/collect_images.py --sources wikimedia  # ソースを限定
 
-# 0'. （任意）目視で選別しながら収集するUI。クエリ検索 → サムネイル一覧から
-#     適した画像だけチェックして保存（保存済み・除外済みはグレーアウト/非表示）
+# 0'. （任意）目視で選別しながら収集するUI。ソースとクエリを選んで検索 → サムネイル
+#     一覧から適した画像だけチェックして保存（保存済み・除外済みはグレーアウト/非表示）
 uv run streamlit run app/collect.py
 
 # 1. 問題設定 + 画像アップロード + アノテーション（ブラウザが開く）
@@ -49,6 +50,30 @@ uv run python -m pipeline.run_loop
 ```
 
 完了すると `results/final_report.md` に test スコア・混同行列・特徴量スキーマの変遷が出力される。
+
+### 画像収集ソースとAPIキー
+
+| ソース | APIキー | 取得先 | レート制限 | 記録されるライセンス |
+|---|---|---|---|---|
+| openverse | 不要 | — | 匿名は低め（検索間3秒） | CC (`by-nc-nd` 等) |
+| wikimedia | 不要 | — | 検索間1.5秒 | `CC BY-SA 4.0` 等 |
+| pixabay | `PIXABAY_API_KEY` | https://pixabay.com/api/docs/ | 100 req/分 | `pixabay` (Content License) |
+| pexels | `PEXELS_API_KEY` | https://www.pexels.com/api/ | 200 req/時 | `pexels` (Pexels License) |
+| flickr | `FLICKR_API_KEY` ※ | https://www.flickr.com/services/api/ | 3600 req/時 | CC (`by` 等、CC系のみ検索) |
+| google | `GOOGLE_API_KEY` + `GOOGLE_CSE_ID` | https://developers.google.com/custom-search | 100 クエリ/日（無料枠） | `unknown` ⚠️ |
+
+キーはプロジェクトルートの `.env` に書く（gitignore 済み）:
+
+```bash
+PIXABAY_API_KEY=xxxx
+PEXELS_API_KEY=xxxx
+FLICKR_API_KEY=xxxx
+```
+
+- ※ Flickr の新規APIキー発行は有料の Flickr Pro アカウント限定。ただし Flickr の CC 画像は Openverse がインデックスしているため、openverse ソース経由でほぼカバーできる
+- `--sources auto`（既定）はキー設定済みのソースを全部使い、複数ソースをインターリーブして収集する。キー未設定のソースは `[skip]` 表示でスキップされる
+- google はライセンス情報が取得できず `license=unknown` で記録されるため、既定には含まれない。`--sources google` と明示指定したときだけ使う最終手段
+- 重複は「ソースID・掲載元URL・画像バイトのMD5」の3段階で排除される（Openverse経由で取得済みのFlickr写真をFlickr直APIで再取得しない）
 
 ### 動作確認（合成データでのE2E）
 

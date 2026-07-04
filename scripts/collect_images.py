@@ -1,4 +1,4 @@
-"""保育写真スコアリングモデル用の学習画像を Openverse API から収集する。
+"""保育写真スコアリングモデル用の学習画像を各種画像APIから収集する。
 
 売れる写真だけでなく「売れない写真」のバリエーション（ブレ・逆光・後ろ姿・
 表情不明瞭・人物なし・人物極小・顔見切れ）を8カテゴリで集める。
@@ -8,11 +8,16 @@
     uv run python scripts/collect_images.py                 # 8カテゴリ x 50枚
     uv run python scripts/collect_images.py --per-category 3
     uv run python scripts/collect_images.py --categories good,backlit
+    uv run python scripts/collect_images.py --sources wikimedia,flickr
+
+ソース: openverse, pixabay, pexels, wikimedia, flickr, google（scripts/sources/ 参照）。
+APIキーが必要なソースはプロジェクトルートの .env（PIXABAY_API_KEY 等）で設定する。
+--sources auto（既定）はキー設定済みの既定ソース全部を使う（google は除く）。
 
 出力:
-    data/images/{category}_{連番}_{openverse id先頭8桁}.jpg   # 実写
-    data/images/{category}_syn_{連番}.jpg                     # 加工画像
-    data/collection_metadata.csv                              # 出典・ライセンス・加工パラメータ
+    data/images/{category}_{連番}_{ソース略号}_{id先頭8桁}.jpg  # 実写
+    data/images/{category}_syn_{連番}.jpg                       # 加工画像
+    data/collection_metadata.csv                                # 出典・ライセンス・加工パラメータ
 
 再実行すると metadata.csv を読んで取得済み画像をスキップし、続きから収集する。
 """
@@ -23,7 +28,9 @@ import argparse
 import csv
 import hashlib
 import io
+import os
 import random
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -33,22 +40,26 @@ from PIL import Image, ImageEnhance, ImageFilter
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from pipeline.config import DATA_DIR, IMAGES_DIR  # noqa: E402
+from scripts.sources import get_sources, load_dotenv  # noqa: E402
+from scripts.sources.base import (  # noqa: E402
+    USER_AGENT,
+    ImageSource,
+    SearchResult,
+    safe_id,
+)
 
 METADATA_CSV = DATA_DIR / "collection_metadata.csv"
-API_URL = "https://api.openverse.org/v1/images/"
-USER_AGENT = "automatic-ml-model-collector/0.1 (ML research dataset collection)"
-SEARCH_SLEEP = 3.0  # 匿名アクセスのレート制限対策
 DOWNLOAD_SLEEP = 0.7
 MIN_SHORT_SIDE = 400
 MAX_ASPECT = 3.0
 MAX_PAGES_PER_QUERY = 5
-PAGE_SIZE = 20
 
 METADATA_FIELDS = [
     "filename",
     "category",
     "is_synthetic",
-    "openverse_id",
+    "source",
+    "source_id",
     "base_filename",
     "image_url",
     "foreign_landing_url",
@@ -170,10 +181,31 @@ BASE_POOL_QUERIES = [
 
 
 def load_metadata() -> list[dict]:
+    """メタデータCSVを読む。旧スキーマ（openverse_id 列）は自動で移行する。"""
     if not METADATA_CSV.exists():
         return []
     with open(METADATA_CSV, newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        rows = list(reader)
+    if "source" in fieldnames or "openverse_id" not in fieldnames:
+        return rows
+    # 旧スキーマ: openverse_id 列を source / source_id の2列に置き換える
+    bak = METADATA_CSV.with_name(METADATA_CSV.name + ".bak")
+    if not bak.exists():
+        shutil.copy2(METADATA_CSV, bak)
+    for row in rows:
+        sid = row.pop("openverse_id", "") or ""
+        row["source"] = "openverse" if sid else ""
+        row["source_id"] = sid
+    tmp = METADATA_CSV.with_name(METADATA_CSV.name + ".tmp")
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=METADATA_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(tmp, METADATA_CSV)
+    print(f"{METADATA_CSV.name} を新スキーマへ移行しました（backup: {bak.name}）")
+    return rows
 
 
 def append_metadata(rows: list[dict]) -> None:
@@ -185,32 +217,9 @@ def append_metadata(rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
-def search_openverse(query: str, page: int) -> list[dict]:
-    resp = requests.get(
-        API_URL,
-        params={
-            "q": query,
-            "page_size": PAGE_SIZE,
-            "page": page,
-            "category": "photograph",  # イラスト・デジタルアートを除外
-        },
-        headers={"User-Agent": USER_AGENT},
-        timeout=30,
-    )
-    if resp.status_code == 429:
-        print("    レート制限。60秒待機...")
-        time.sleep(60)
-        return search_openverse(query, page)
-    resp.raise_for_status()
-    return resp.json().get("results", [])
-
-
-def is_relevant(result: dict, keywords: list[str]) -> bool:
+def is_relevant(result: SearchResult, keywords: list[str]) -> bool:
     """タイトルまたはタグに keywords のいずれかを含むか（無関係画像の除外用）。"""
-    text = (result.get("title") or "").lower()
-    text += " " + " ".join(
-        (t.get("name") or "").lower() for t in (result.get("tags") or [])
-    )
+    text = (result.title + " " + " ".join(result.tags)).lower()
     return any(k in text for k in keywords)
 
 
@@ -234,7 +243,16 @@ def download_image(url: str) -> Image.Image | None:
 class Collector:
     def __init__(self):
         self.rows: list[dict] = load_metadata()
-        self.seen_ids = {r["openverse_id"] for r in self.rows if r["openverse_id"]}
+        self.seen_ids = {
+            f"{r['source']}:{r['source_id']}" for r in self.rows if r["source_id"]
+        }
+        # 掲載元URLでのソース横断重複排除（例: Openverse経由で取得済みの
+        # Flickr写真を Flickr 直APIで再取得しない）
+        self.seen_foreign = {
+            r["foreign_landing_url"].rstrip("/")
+            for r in self.rows
+            if r["foreign_landing_url"]
+        }
         self.seen_hashes: set[str] = set()
         for r in self.rows:
             path = IMAGES_DIR / r["filename"]
@@ -256,59 +274,77 @@ class Collector:
         append_metadata([row])
 
     def collect_from_queries(
-        self, category: str, queries: list[str], target: int, keywords: list[str]
+        self,
+        category: str,
+        queries: list[str],
+        target: int,
+        keywords: list[str],
+        sources: list[ImageSource],
     ) -> int:
-        """target 枚に達するまで検索・ダウンロードする。取得できた枚数を返す。"""
+        """target 枚に達するまで検索・ダウンロードする。取得できた枚数を返す。
+
+        page -> query -> source の順で回してソースをインターリーブし、
+        単一ソースへの偏りを防ぐ。レート制限はソースごとに throttle() で管理。
+        """
         got = self.count(category)
         if got >= target:
             print(f"  [{category}] 既に {got} 枚あり。スキップ")
             return got
         for page in range(1, MAX_PAGES_PER_QUERY + 1):
             for query in queries:
-                if got >= target:
-                    return got
-                time.sleep(SEARCH_SLEEP)
-                try:
-                    results = search_openverse(query, page)
-                except Exception as e:
-                    print(f"    検索失敗 ({query} p{page}): {e}")
-                    continue
-                for r in results:
+                for source in sources:
                     if got >= target:
                         return got
-                    if r["id"] in self.seen_ids or not r.get("url"):
+                    source.throttle()
+                    try:
+                        results = source.search(query, page)
+                    except Exception as e:
+                        print(f"    検索失敗 ({source.name} {query} p{page}): {e}")
                         continue
-                    if not is_relevant(r, keywords):
-                        continue
-                    self.seen_ids.add(r["id"])
-                    img = download_image(r["url"])
-                    time.sleep(DOWNLOAD_SLEEP)
-                    if img is None:
-                        continue
-                    buf = io.BytesIO()
-                    img.save(buf, "JPEG", quality=90)
-                    digest = hashlib.md5(buf.getvalue()).hexdigest()
-                    if digest in self.seen_hashes:
-                        continue
-                    self.seen_hashes.add(digest)
-                    got += 1
-                    filename = f"{category}_{got:04d}_{r['id'][:8]}.jpg"
-                    self.save(
-                        img,
-                        filename,
-                        {
-                            "category": category,
-                            "is_synthetic": "false",
-                            "openverse_id": r["id"],
-                            "image_url": r["url"],
-                            "foreign_landing_url": r.get("foreign_landing_url", ""),
-                            "license": r.get("license", ""),
-                            "license_version": r.get("license_version", ""),
-                            "creator": r.get("creator", ""),
-                            "query": query,
-                        },
-                    )
-                    print(f"  [{category}] {got}/{target} {filename}")
+                    for r in results:
+                        if got >= target:
+                            return got
+                        if r.key in self.seen_ids or not r.image_url:
+                            continue
+                        foreign = r.foreign_landing_url.rstrip("/")
+                        if foreign and foreign in self.seen_foreign:
+                            continue
+                        if not is_relevant(r, keywords):
+                            continue
+                        self.seen_ids.add(r.key)
+                        img = download_image(r.image_url)
+                        time.sleep(DOWNLOAD_SLEEP)
+                        if img is None:
+                            continue
+                        buf = io.BytesIO()
+                        img.save(buf, "JPEG", quality=90)
+                        digest = hashlib.md5(buf.getvalue()).hexdigest()
+                        if digest in self.seen_hashes:
+                            continue
+                        self.seen_hashes.add(digest)
+                        if foreign:
+                            self.seen_foreign.add(foreign)
+                        got += 1
+                        filename = (
+                            f"{category}_{got:04d}_{source.prefix}_{safe_id(r.source_id)}.jpg"
+                        )
+                        self.save(
+                            img,
+                            filename,
+                            {
+                                "category": category,
+                                "is_synthetic": "false",
+                                "source": r.source,
+                                "source_id": r.source_id,
+                                "image_url": r.image_url,
+                                "foreign_landing_url": r.foreign_landing_url,
+                                "license": r.license,
+                                "license_version": r.license_version,
+                                "creator": r.creator,
+                                "query": query,
+                            },
+                        )
+                        print(f"  [{category}] {got}/{target} {filename}")
         return got
 
 
@@ -375,6 +411,12 @@ def main() -> None:
         help="カンマ区切りで対象カテゴリを限定",
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--sources",
+        default="auto",
+        help="カンマ区切り (openverse,pixabay,pexels,wikimedia,flickr,google)。"
+        "auto=キー設定済みの既定ソース全部（google を除く）",
+    )
     args = parser.parse_args()
 
     targets = [c.strip() for c in args.categories.split(",") if c.strip()]
@@ -382,11 +424,25 @@ def main() -> None:
     if unknown:
         parser.error(f"未知のカテゴリ: {unknown}")
 
+    load_dotenv()
+    names = (
+        None
+        if args.sources == "auto"
+        else [s.strip() for s in args.sources.split(",") if s.strip()]
+    )
+    try:
+        sources = get_sources(names)
+    except ValueError as e:
+        parser.error(str(e))
+    if not sources:
+        parser.error("使用可能なソースがありません（.env のAPIキーまたは --sources を確認）")
+    print(f"使用ソース: {', '.join(s.name for s in sources)}")
+
     rng = random.Random(args.seed)
     collector = Collector()
 
     # Phase 1: 実写の収集
-    print("=== Phase 1: Openverse からの実写収集 ===")
+    print("=== Phase 1: 実写収集 ===")
     for category in targets:
         print(f"[{category}] 目標 {args.per_category} 枚")
         collector.collect_from_queries(
@@ -394,6 +450,7 @@ def main() -> None:
             CATEGORIES[category]["queries"],
             args.per_category,
             CATEGORIES[category]["keywords"],
+            sources,
         )
 
     # Phase 2: 不足カテゴリを加工で補完
@@ -407,7 +464,7 @@ def main() -> None:
         print(f"=== Phase 2: 加工補完（{shortfalls} / ベース画像 {total_needed} 枚追加取得）===")
         # 既存カテゴリと重複しない画像をベースとして追加取得（split 間の近重複リークを防ぐ）
         collector.collect_from_queries(
-            "_base_pool", BASE_POOL_QUERIES, total_needed, PERSON_WORDS
+            "_base_pool", BASE_POOL_QUERIES, total_needed, PERSON_WORDS, sources
         )
         base_rows = [r for r in collector.rows if r["category"] == "_base_pool"]
         rng.shuffle(base_rows)

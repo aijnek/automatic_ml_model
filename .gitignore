@@ -15,6 +15,9 @@ wheels/
 # Virtual environments
 .venv
 
+# APIキー
+.env
+
 # パイプライン生成物
 data/
 schemas/
