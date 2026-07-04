@@ -9,6 +9,22 @@
     uv run python scripts/collect_images.py --per-category 3
     uv run python scripts/collect_images.py --categories good,backlit
     uv run python scripts/collect_images.py --sources wikimedia,flickr
+    uv run python scripts/collect_images.py --plan data/collection_plan.json
+
+--plan で任意課題向けの収集プランJSONを与えると、組み込みの8カテゴリの代わりに
+プランのカテゴリ定義（queries / keywords / synthetic / per_category）を使う:
+    {
+      "categories": {
+        "bucket_name": {
+          "queries": ["search query", ...],       # 必須
+          "keywords": ["relevance", ...],          # 省略・空 = 関連性フィルタなし
+          "synthetic": null,                       # または AUGMENTATIONS のキー
+          "per_category": 50                       # 省略時は --per-category
+        }
+      },
+      "base_pool_queries": ["..."],   # synthetic 指定カテゴリがある場合に必須
+      "base_pool_keywords": ["..."]   # 省略可
+    }
 
 ソース: openverse, pixabay, pexels, wikimedia, flickr, google（scripts/sources/ 参照）。
 APIキーが必要なソースはプロジェクトルートの .env（PIXABAY_API_KEY 等）で設定する。
@@ -28,8 +44,10 @@ import argparse
 import csv
 import hashlib
 import io
+import json
 import os
 import random
+import re
 import shutil
 import sys
 import time
@@ -81,11 +99,11 @@ PLACE_WORDS = [
     "gym", "nursery", "park",
 ]
 
-# カテゴリ定義:
+# カテゴリ定義（保育写真プロジェクトの組み込みデフォルト。--plan で差し替え可能）:
 #   queries   実写の検索クエリ
 #   keywords  タイトルまたはタグにいずれかを含まない画像は除外（関連性フィルタ）
 #   synthetic 不足分の補完に使う加工名
-CATEGORIES: dict[str, dict] = {
+DEFAULT_CATEGORIES: dict[str, dict] = {
     "good": {
         "queries": [
             "kindergarten children playing",
@@ -178,6 +196,58 @@ BASE_POOL_QUERIES = [
     "children birthday party",
     "toddler playing garden",
 ]
+
+# 後方互換エイリアス
+CATEGORIES = DEFAULT_CATEGORIES
+
+BUCKET_NAME_RE = re.compile(r"[a-z][a-z0-9_]*")
+
+
+def load_plan(path: Path) -> tuple[dict[str, dict], list[str], list[str]]:
+    """収集プランJSONを読み込み検証する。
+
+    Returns:
+        (categories, base_pool_queries, base_pool_keywords)
+        categories は DEFAULT_CATEGORIES と同じ形式（+ 任意の per_category キー）。
+    """
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    raw = data.get("categories")
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError("plan: 非空の categories オブジェクトが必要です")
+    categories: dict[str, dict] = {}
+    for name, spec in raw.items():
+        if name == "_base_pool" or not BUCKET_NAME_RE.fullmatch(name):
+            raise ValueError(
+                f"plan: カテゴリ名 {name!r} が不正です（英小文字始まりの [a-z0-9_]+、"
+                "_base_pool は予約名）"
+            )
+        if not isinstance(spec, dict):
+            raise ValueError(f"plan: {name} の定義はオブジェクトが必要です")
+        queries = spec.get("queries")
+        if not isinstance(queries, list) or not queries:
+            raise ValueError(f"plan: {name}.queries は非空のリストが必要です")
+        synthetic = spec.get("synthetic")
+        if synthetic is not None and synthetic not in AUGMENTATIONS:
+            raise ValueError(
+                f"plan: {name}.synthetic が不正です: {synthetic!r}"
+                f"（{sorted(AUGMENTATIONS)} または null）"
+            )
+        per_category = spec.get("per_category")
+        if per_category is not None and (
+            not isinstance(per_category, int) or per_category < 1
+        ):
+            raise ValueError(f"plan: {name}.per_category は正の整数が必要です")
+        categories[name] = {
+            "queries": [str(q) for q in queries],
+            "keywords": [str(k).lower() for k in spec.get("keywords") or []],
+            "synthetic": synthetic,
+            "per_category": per_category,
+        }
+    base_pool_queries = [str(q) for q in data.get("base_pool_queries") or []]
+    base_pool_keywords = [str(k).lower() for k in data.get("base_pool_keywords") or []]
+    if any(c["synthetic"] for c in categories.values()) and not base_pool_queries:
+        raise ValueError("plan: synthetic 指定カテゴリには base_pool_queries が必要です")
+    return categories, base_pool_queries, base_pool_keywords
 
 
 def load_metadata() -> list[dict]:
@@ -309,7 +379,7 @@ class Collector:
                         foreign = r.foreign_landing_url.rstrip("/")
                         if foreign and foreign in self.seen_foreign:
                             continue
-                        if not is_relevant(r, keywords):
+                        if keywords and not is_relevant(r, keywords):
                             continue
                         self.seen_ids.add(r.key)
                         img = download_image(r.image_url)
@@ -407,8 +477,14 @@ def main() -> None:
     parser.add_argument("--per-category", type=int, default=50)
     parser.add_argument(
         "--categories",
-        default=",".join(CATEGORIES),
-        help="カンマ区切りで対象カテゴリを限定",
+        default=None,
+        help="カンマ区切りで対象カテゴリを限定（既定: 有効なカテゴリ定義の全部）",
+    )
+    parser.add_argument(
+        "--plan",
+        type=Path,
+        default=None,
+        help="収集プランJSONのパス。組み込みカテゴリの代わりに使う（モジュールdocstring参照）",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -419,10 +495,25 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    targets = [c.strip() for c in args.categories.split(",") if c.strip()]
-    unknown = set(targets) - set(CATEGORIES)
+    if args.plan:
+        try:
+            categories, base_pool_queries, base_pool_keywords = load_plan(args.plan)
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            parser.error(f"--plan の読み込みに失敗: {e}")
+        print(f"収集プラン: {args.plan}（{len(categories)} カテゴリ）")
+    else:
+        categories = DEFAULT_CATEGORIES
+        base_pool_queries = BASE_POOL_QUERIES
+        base_pool_keywords = PERSON_WORDS
+
+    raw_targets = args.categories or ",".join(categories)
+    targets = [c.strip() for c in raw_targets.split(",") if c.strip()]
+    unknown = set(targets) - set(categories)
     if unknown:
         parser.error(f"未知のカテゴリ: {unknown}")
+    per_target = {
+        c: categories[c].get("per_category") or args.per_category for c in targets
+    }
 
     load_dotenv()
     names = (
@@ -444,33 +535,33 @@ def main() -> None:
     # Phase 1: 実写の収集
     print("=== Phase 1: 実写収集 ===")
     for category in targets:
-        print(f"[{category}] 目標 {args.per_category} 枚")
+        print(f"[{category}] 目標 {per_target[category]} 枚")
         collector.collect_from_queries(
             category,
-            CATEGORIES[category]["queries"],
-            args.per_category,
-            CATEGORIES[category]["keywords"],
+            categories[category]["queries"],
+            per_target[category],
+            categories[category]["keywords"],
             sources,
         )
 
     # Phase 2: 不足カテゴリを加工で補完
     shortfalls = {
-        c: args.per_category - collector.count(c)
+        c: per_target[c] - collector.count(c)
         for c in targets
-        if CATEGORIES[c]["synthetic"] and collector.count(c) < args.per_category
+        if categories[c]["synthetic"] and collector.count(c) < per_target[c]
     }
     if shortfalls:
         total_needed = sum(shortfalls.values())
         print(f"=== Phase 2: 加工補完（{shortfalls} / ベース画像 {total_needed} 枚追加取得）===")
         # 既存カテゴリと重複しない画像をベースとして追加取得（split 間の近重複リークを防ぐ）
         collector.collect_from_queries(
-            "_base_pool", BASE_POOL_QUERIES, total_needed, PERSON_WORDS, sources
+            "_base_pool", base_pool_queries, total_needed, base_pool_keywords, sources
         )
         base_rows = [r for r in collector.rows if r["category"] == "_base_pool"]
         rng.shuffle(base_rows)
         idx = 0
         for category, needed in shortfalls.items():
-            aug_fn = AUGMENTATIONS[CATEGORIES[category]["synthetic"]]
+            aug_fn = AUGMENTATIONS[categories[category]["synthetic"]]
             for i in range(needed):
                 if idx >= len(base_rows):
                     print(f"  [{category}] ベース画像不足。{i}/{needed} 枚で終了")
