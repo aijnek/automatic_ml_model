@@ -52,6 +52,11 @@ class Config:
         default_factory=lambda: list(DEFAULT_DESIGNER_COMMAND)
     )
     vlm_model: str = DEFAULT_VLM_MODEL
+    # 学習・イテレーション合否判定（step 6-7）。既定は単一 train/val 分割。
+    # 有効化すると train+val を cv_folds 分割した out-of-fold スコアで判定する
+    # （val が少数だと単一分割の合否判定が偶然に左右されやすいための代替経路）
+    cv_enabled: bool = False
+    cv_folds: int = 5
     # 抽出品質検証（step 4.5）。正解ラベルなしで特徴量ごとの抽出信頼性を測る
     verification_enabled: bool = True
     reference_vlm_model: str = DEFAULT_REFERENCE_VLM_MODEL
@@ -68,6 +73,10 @@ class Config:
     feature_selection_enabled: bool = True
     select_max_score_drop: float = 0.01  # baseline からの許容 val スコア低下
     select_min_features: int = 1  # これ未満には削減しない
+    # 既定は無効（従来どおり train/val 単一分割で採否判定）。有効化すると
+    # train+val を select_cv_folds 分割した交差検証平均で採否判定する
+    select_cv_enabled: bool = False
+    select_cv_folds: int = 5
 
     @property
     def is_classification(self) -> bool:
@@ -105,6 +114,8 @@ def save_config(cfg: Config, path: Path = CONFIG_PATH) -> None:
                 "val": cfg.split_ratios[1],
                 "test": cfg.split_ratios[2],
             },
+            "cv_enabled": cfg.cv_enabled,
+            "cv_folds": cfg.cv_folds,
         },
         "llm": {
             "designer_command": cfg.designer_command,
@@ -128,6 +139,8 @@ def save_config(cfg: Config, path: Path = CONFIG_PATH) -> None:
             "enabled": cfg.feature_selection_enabled,
             "max_score_drop": cfg.select_max_score_drop,
             "min_features": cfg.select_min_features,
+            "cv_enabled": cfg.select_cv_enabled,
+            "cv_folds": cfg.select_cv_folds,
         },
     }
     path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False))
@@ -157,6 +170,8 @@ def load_config(path: Path = CONFIG_PATH) -> Config:
             float(split.get("val", 0.15)),
             float(split.get("test", 0.15)),
         ),
+        cv_enabled=bool(training.get("cv_enabled", False)),
+        cv_folds=int(training.get("cv_folds", 5)),
         designer_command=list(llm.get("designer_command") or DEFAULT_DESIGNER_COMMAND),
         vlm_model=llm.get("vlm_model", DEFAULT_VLM_MODEL),
         verification_enabled=bool(verification.get("enabled", True)),
@@ -174,6 +189,8 @@ def load_config(path: Path = CONFIG_PATH) -> Config:
         feature_selection_enabled=bool(selection.get("enabled", True)),
         select_max_score_drop=float(selection.get("max_score_drop", 0.01)),
         select_min_features=int(selection.get("min_features", 1)),
+        select_cv_enabled=bool(selection.get("cv_enabled", False)),
+        select_cv_folds=int(selection.get("cv_folds", 5)),
     )
     cfg.validate()
     return cfg

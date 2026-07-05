@@ -250,13 +250,23 @@ def build_final_report_md(
         )
 
     if selection is not None:
+        use_cv = selection.get("cv_enabled", False)
+        score_label = f"CV({selection['cv_folds']}分割) {cfg.metric_name}" if use_cv else f"val {cfg.metric_name}"
+        baseline_score = selection["baseline_cv_score"] if use_cv else selection["baseline_val_score"]
+        final_score = selection["final_cv_score"] if use_cv else selection["final_val_score"]
         lines += [
             "",
             "## 特徴量選択（後方消去）",
             "",
-            f"- val {cfg.metric_name}: {selection['baseline_val_score']:.4f} → "
-            f"{selection['final_val_score']:.4f}"
+            f"- 採否判定に使った{score_label}: {baseline_score:.4f} → {final_score:.4f}"
             f"（許容低下 {selection['max_score_drop']}）",
+        ]
+        if use_cv:
+            lines.append(
+                f"- 参考: val単一分割 {cfg.metric_name}: "
+                f"{selection['baseline_val_score']:.4f} → {selection['final_val_score']:.4f}"
+            )
+        lines += [
             f"- 特徴量数: {selection['n_features_before']} → "
             f"{selection['n_features_after']}",
             "- 除去: "
@@ -265,13 +275,13 @@ def build_final_report_md(
         if selection["rounds"]:
             lines += [
                 "",
-                f"| ラウンド | 除去候補 | 重要度 | val {cfg.metric_name} | 低下 | 判定 |",
+                f"| ラウンド | 除去候補 | 重要度 | {score_label} | 低下 | 判定 |",
                 "|---|---|---|---|---|---|",
             ]
             for i, r in enumerate(selection["rounds"], start=1):
                 lines.append(
                     f"| {i} | {r['feature']} | {r['importance']:.4f} "
-                    f"| {r['val_score']:.4f} | {r['score_drop']:+.4f} "
+                    f"| {r['score']:.4f} | {r['score_drop']:+.4f} "
                     f"| {'採用' if r['accepted'] else '棄却'} |"
                 )
 

@@ -40,7 +40,7 @@ from pipeline.report import (
     save_iteration_report,
 )
 from pipeline.select import select_features
-from pipeline.train import evaluate_on_test, train_and_evaluate
+from pipeline.train import evaluate_on_test, train_and_evaluate, train_and_evaluate_cv
 from pipeline.verify import run_verification
 
 logger = logging.getLogger("run_loop")
@@ -184,8 +184,10 @@ def run(
             vlm_fn=vlm_fn,
         )
 
-        # step 6: LightGBM 学習・val 評価
-        result = train_and_evaluate(
+        # step 6: LightGBM 学習・評価（既定は val 単一分割、cfg.cv_enabled で
+        # train+val の交差検証 out-of-fold スコアに切り替え可能）
+        train_fn = train_and_evaluate_cv if cfg.cv_enabled else train_and_evaluate
+        result = train_fn(
             cfg,
             schema,
             features_df,

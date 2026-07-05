@@ -14,6 +14,7 @@ from sklearn.metrics import (
     mean_absolute_error,
     r2_score,
 )
+from sklearn.model_selection import KFold, StratifiedKFold
 
 from pipeline.config import Config
 from pipeline.designer import active_features
@@ -122,6 +123,108 @@ def _to_py(v):
     if pd.isna(v):
         return None
     return v
+
+
+def make_cv_folds(cfg: Config, df: pd.DataFrame, n_splits: int):
+    """df を分割する splitter と split() への引数を返す。
+
+    データが少なくクラス最小件数が n_splits を下回る場合は分割数を落とす
+    （StratifiedKFold は各クラス n_splits 件以上を要求するため）。
+    """
+    if cfg.is_classification:
+        min_class_count = int(df["label"].value_counts().min())
+        n_splits = max(2, min(n_splits, min_class_count))
+        splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=cfg.seed)
+        return splitter, (df, df["label"])
+    n_splits = max(2, min(n_splits, len(df) // 2))
+    splitter = KFold(n_splits=n_splits, shuffle=True, random_state=cfg.seed)
+    return splitter, (df,)
+
+
+def train_and_evaluate_cv(
+    cfg: Config,
+    schema: dict,
+    features_df: pd.DataFrame,
+    splits: dict[str, pd.DataFrame],
+    model_path: Path | None = None,
+) -> dict:
+    """train+val を合わせて cfg.cv_folds 分割し、out-of-fold 予測でスコアを出す。
+
+    単一の val 分割（少数データでは分散が大きい）に判定を依存させないための
+    代替経路。イテレーションの合否判定・ベストイテレーション選定に使う。
+
+    最終的な `_model`（test 評価・特徴量選択に渡す実体）は、各 fold の
+    best_iteration の平均を木の本数として、train+val 全体で改めて1本
+    学習し直したもの（fold 別モデルのアンサンブルにはしない）。
+    """
+    train_val_df = pd.concat([splits["train"], splits["val"]], ignore_index=True)
+    splitter, split_args = make_cv_folds(cfg, train_val_df, cfg.cv_folds)
+
+    oof_pred = np.empty(len(train_val_df), dtype=object)
+    importance_sums: dict[str, float] = {}
+    best_iterations: list[int] = []
+    n_folds = 0
+
+    for train_idx, val_idx in splitter.split(*split_args):
+        fold_splits = {
+            "train": train_val_df.iloc[train_idx],
+            "val": train_val_df.iloc[val_idx],
+        }
+        fold_result = train_and_evaluate(cfg, schema, features_df, fold_splits)
+        X_fold_val, _, _ = prepare_matrix(features_df, fold_splits["val"], schema)
+        fold_pred = fold_result["_model"].predict(X_fold_val)
+        for pos, pred in zip(val_idx, fold_pred):
+            oof_pred[pos] = pred
+        for name, imp in fold_result["feature_importances"].items():
+            importance_sums[name] = importance_sums.get(name, 0.0) + imp
+        best_iterations.append(fold_result["best_iteration"] or 1)
+        n_folds += 1
+
+    importance_map = {
+        name: total / n_folds
+        for name, total in sorted(importance_sums.items(), key=lambda x: -x[1])
+    }
+
+    y_true = train_val_df["label"]
+    if not cfg.is_classification:
+        y_true = pd.to_numeric(y_true)
+        oof_pred = oof_pred.astype(float)
+    metrics = _evaluate(cfg, y_true, oof_pred)
+    val_score = metrics[cfg.metric_name]
+
+    # 最終モデル: train+val 全体で、fold の平均木本数を使い早期終了なしで1本学習
+    final_n_estimators = max(1, round(float(np.mean(best_iterations))))
+    X_all, y_all, all_files = prepare_matrix(features_df, train_val_df, schema)
+    final_params = dict(LGBM_PARAMS)
+    final_params["n_estimators"] = final_n_estimators
+    if cfg.is_classification:
+        final_model = lgb.LGBMClassifier(random_state=cfg.seed, **final_params)
+    else:
+        final_model = lgb.LGBMRegressor(random_state=cfg.seed, **final_params)
+        y_all = pd.to_numeric(y_all)
+    final_model.fit(X_all, y_all)
+
+    if model_path is not None:
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        final_model.booster_.save_model(str(model_path))
+
+    result = {
+        "task_type": cfg.task_type,
+        "metric_name": cfg.metric_name,
+        "val_score": val_score,
+        "val_metrics": metrics,
+        "feature_importances": importance_map,
+        "worst_val_samples": _worst_samples(cfg, X_all, y_true, oof_pred, all_files),
+        "n_train": len(splits["train"]),
+        "n_val": len(train_val_df),
+        "best_iteration": final_n_estimators,
+        "cv_folds": n_folds,
+        "_model": final_model,
+    }
+    logger.info(
+        "学習完了(CV %d分割, out-of-fold): %s = %.4f", n_folds, cfg.metric_name, val_score
+    )
+    return result
 
 
 def train_and_evaluate(

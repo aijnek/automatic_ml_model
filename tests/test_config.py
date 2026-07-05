@@ -51,3 +51,21 @@ def test_config_defaults_without_feature_selection_block(tmp_path, clf_config):
     assert loaded.feature_selection_enabled is True
     assert loaded.select_max_score_drop == 0.01
     assert loaded.select_min_features == 1
+    assert loaded.select_cv_enabled is False
+    assert loaded.select_cv_folds == 5
+
+
+def test_config_cv_defaults_off(clf_config):
+    assert clf_config.cv_enabled is False
+    assert clf_config.select_cv_enabled is False
+
+
+def test_config_roundtrip_with_cv(tmp_path, clf_config):
+    clf_config.cv_enabled = True
+    clf_config.cv_folds = 4
+    clf_config.select_cv_enabled = True
+    clf_config.select_cv_folds = 3
+    path = tmp_path / "config.yaml"
+    save_config(clf_config, path)
+    loaded = load_config(path)
+    assert loaded == clf_config

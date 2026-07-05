@@ -65,6 +65,7 @@ def test_removes_uninformative_features(clf_setup, tmp_path):
     active = [f["name"] for f in active_features(selection["schema"])]
     assert "dominant_color" in active  # 支配的な特徴量は残る
     assert selection["removed"], "ノイズ特徴量が少なくとも1つ除去されるはず"
+    assert not selection["cv_enabled"]  # 既定は無効
     assert selection["final_val_score"] >= baseline["val_score"] - cfg.select_max_score_drop
     for f in selection["schema"]["features"]:
         if f["name"] in selection["removed"]:
@@ -190,6 +191,9 @@ def test_output_json_serializable(clf_setup, tmp_path):
     assert {
         "baseline_val_score",
         "final_val_score",
+        "cv_enabled",
+        "baseline_cv_score",
+        "final_cv_score",
         "rounds",
         "removed",
         "n_features_before",
@@ -197,6 +201,24 @@ def test_output_json_serializable(clf_setup, tmp_path):
     } <= set(saved)
     assert "schema" not in saved
     assert "result" not in saved
+
+
+def test_cv_enabled_uses_cross_validation(clf_setup):
+    """select_cv_enabled=True では train+val の交差検証平均で採否判定する。"""
+    cfg, schema, features, splits, baseline = clf_setup
+    cfg.select_cv_enabled = True
+    selection = select_mod.select_features(cfg, schema, features, splits, baseline)
+
+    assert selection["cv_enabled"] is True
+    assert selection["baseline_cv_score"] is not None
+    assert selection["final_cv_score"] is not None
+    assert selection["removed"], "ノイズ特徴量が少なくとも1つ除去されるはず"
+    assert (
+        selection["final_cv_score"]
+        >= selection["baseline_cv_score"] - cfg.select_max_score_drop
+    )
+    for r in selection["rounds"]:
+        assert "score" in r  # ラウンド毎の記録はCVスコアで残る
 
 
 def test_all_removals_rejected(clf_setup, tmp_path):

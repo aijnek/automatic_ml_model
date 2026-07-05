@@ -102,6 +102,45 @@ def test_model_saved(clf_setup, tmp_path):
     assert model_path.exists() and model_path.stat().st_size > 0
 
 
+def test_cv_training_matches_single_split_quality(clf_setup, tmp_path):
+    """train_and_evaluate_cv は train+val の out-of-fold スコアで評価する。"""
+    cfg, schema, features, splits = clf_setup
+    model_path = tmp_path / "model_cv.txt"
+    result = train_mod.train_and_evaluate_cv(
+        cfg, schema, features, splits, model_path=model_path
+    )
+    assert result["metric_name"] == "macro_f1"
+    assert result["val_score"] > 0.8  # ほぼ決定的な特徴量なので単一分割同様に高精度
+    assert result["n_val"] == len(splits["train"]) + len(splits["val"])
+    assert result["cv_folds"] >= 2
+    assert model_path.exists() and model_path.stat().st_size > 0
+    # test評価にそのまま使える完成済みモデルであること
+    test_result = train_mod.evaluate_on_test(
+        cfg, schema, features, splits["test"], result["_model"]
+    )
+    assert 0.0 <= test_result["test_score"] <= 1.0
+
+
+def test_cv_training_regression(reg_config, reg_annotations, sample_schema):
+    rng = np.random.default_rng(2)
+    n = len(reg_annotations)
+    y = reg_annotations["label"].to_numpy(dtype=float)
+    features = pd.DataFrame(
+        {
+            "filename": reg_annotations["filename"],
+            "dominant_color": rng.choice(["red", "green"], size=n),
+            "brightness": rng.integers(1, 6, size=n),
+            "has_multiple_shapes": rng.integers(0, 2, size=n),
+            "shape_area_ratio": y / 10 + rng.normal(0, 0.02, size=n),
+        }
+    )
+    result = train_mod.train_and_evaluate_cv(
+        reg_config, sample_schema, features, _splits(reg_annotations)
+    )
+    assert result["metric_name"] == "r2"
+    assert result["val_score"] > 0.8
+
+
 def test_evaluate_on_test(clf_setup):
     cfg, schema, features, splits = clf_setup
     result = train_mod.train_and_evaluate(cfg, schema, features, splits)
